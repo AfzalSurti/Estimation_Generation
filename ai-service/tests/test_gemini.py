@@ -1,13 +1,12 @@
 import os
 import sys
-sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+
+sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 from dotenv import load_dotenv
+
 load_dotenv()
 
-import google.genai as genai
+from services.llm_client import chat, get_model
 
-genai.configure(api_key=os.getenv("API_KEY"))
-model = genai.GenerativeModel("gemini-1.5-flash")
-
-response = model.generate_content("Reply with just: Gemini working")
-print(response.text)
+print(f"Model: {get_model()}")
+print(chat("Reply with just: OpenRouter working", max_tokens=20))
