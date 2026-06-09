@@ -13,10 +13,10 @@ from services.drawing_analyzer import (
     merge_extractions,
 )
 
-PDF_DIR = os.path.join(os.path.dirname(__file__), "pdfs")
+from tests.paths import TCS_DRAWING, PLAN_PROFILE_DRAWING
 
 if __name__ == "__main__":
-    pdf_path = os.path.join(PDF_DIR, "NH Division SOR.pdf")
+    pdf_path = TCS_DRAWING if os.path.exists(TCS_DRAWING) else PLAN_PROFILE_DRAWING
     with open(pdf_path, "rb") as f:
         file_bytes = f.read()
 

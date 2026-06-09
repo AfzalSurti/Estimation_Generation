@@ -14,10 +14,10 @@ from services.boq_mapper import (
     generate_boq,
 )
 
-PDF_DIR = os.path.join(os.path.dirname(__file__), "pdfs")
+from tests.paths import NH_SOR
 
 if __name__ == "__main__":
-    nh_path = os.path.join(PDF_DIR, "NH Division SOR.pdf")
+    nh_path = NH_SOR
     with open(nh_path, "rb") as f:
         sor_data = parse_sor_pdf(f.read(), os.path.basename(nh_path))
 

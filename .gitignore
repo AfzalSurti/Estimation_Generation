@@ -22,8 +22,10 @@ build/
 *.DWG
 *.dxf
 *.DXF
-ai-service/tests/pdfs/*
+ai-service/tests/pdfs/**
 !ai-service/tests/pdfs/.gitkeep
+!ai-service/tests/pdfs/sor/.gitkeep
+!ai-service/tests/pdfs/drawing/.gitkeep
 
 # Node
 node_modules/

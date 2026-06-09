@@ -3,10 +3,10 @@ import os
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
 from services.sor_parser import parse_sor_pdf
+from tests.paths import RAJPIPLA_SOR, NH_SOR
 
-PDF_DIR = os.path.join(os.path.dirname(__file__), "pdfs")
-RB_SOR_PATH = os.path.join(PDF_DIR, "Rajpipla SOR.pdf")
-NH_SOR_PATH = os.path.join(PDF_DIR, "NH Division SOR.pdf")
+RB_SOR_PATH = RAJPIPLA_SOR
+NH_SOR_PATH = NH_SOR
 
 def test_sor(path: str, label: str):
     print(f"\n{'='*50}")
