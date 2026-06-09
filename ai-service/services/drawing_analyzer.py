@@ -425,3 +425,23 @@ def _chainage_to_metres(chainage: str) -> float:
         parts = chainage.split("+")
         return float(parts[0]) * 1000 + float(parts[1])
     return float(chainage)
+
+
+def extract_text_layer(file_bytes: bytes) -> dict:
+    import pdfplumber, io
+    pages = []
+    with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+        for i, page in enumerate(pdf.pages, 1):
+            text = page.extract_text() or ""
+            words = page.extract_words() or []
+            pages.append({
+                "page_num": i,
+                "text": text,
+                "word_count": len(words),
+                "has_meaningful_text": len(text.strip()) > 50
+            })
+    return {
+        "total_pages": len(pages),
+        "pages_with_text": sum(1 for p in pages if p["has_meaningful_text"]),
+        "pages": pages
+    }
