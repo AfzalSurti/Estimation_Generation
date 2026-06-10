@@ -1,430 +1,12 @@
 """
 Drawing analyzer for civil engineering BOQ estimation.
 
-Rasterizes engineering drawing PDFs and uses OpenRouter vision models to classify
-pages and extract road segments, pavement layers, and structure details.
+Extracts road cross-section and plan/profile data from engineering drawing PDFs
+using text-layer regex parsing (no Vision AI).
 """
 
-import base64
-import io
-import json
-import os
 import re
 from typing import Any, Optional
-
-from openai import OpenAI
-
-try:
-    from pdf2image import convert_from_bytes
-    PDF2IMAGE_AVAILABLE = True
-except ImportError:
-    PDF2IMAGE_AVAILABLE = False
-
-try:
-    import fitz  # PyMuPDF
-    PYMUPDF_AVAILABLE = True
-except ImportError:
-    PYMUPDF_AVAILABLE = False
-
-try:
-    from PIL import Image
-    PIL_AVAILABLE = True
-except ImportError:
-    PIL_AVAILABLE = False
-
-
-def _get_client() -> OpenAI:
-    """Create OpenRouter OpenAI-compatible client."""
-    return OpenAI(
-        api_key=os.getenv("API_KEY"),
-        base_url=os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
-    )
-
-
-def _get_vision_model() -> str:
-    return os.getenv("VISION_MODEL", "nvidia/nemotron-nano-12b-v2-vl:free")
-
-
-def _parse_json_response(text: str) -> dict:
-    """Extract JSON object from model response text."""
-    text = text.strip()
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        pass
-    match = re.search(r"\{[\s\S]*\}", text)
-    if match:
-        try:
-            return json.loads(match.group())
-        except json.JSONDecodeError:
-            pass
-    return {}
-
-
-def _image_to_base64(image: "Image.Image") -> str:
-    """Convert PIL Image to JPEG base64 string."""
-    buffer = io.BytesIO()
-    image.convert("RGB").save(buffer, format="JPEG", quality=85)
-    return base64.b64encode(buffer.getvalue()).decode("utf-8")
-
-
-def rasterize_pdf_pages(file_bytes: bytes) -> list[dict]:
-    """
-    Convert each PDF page to a base64-encoded JPEG image.
-
-    Returns list of dicts with page_num, base64, width, height.
-    """
-    pages: list[dict] = []
-
-    if PDF2IMAGE_AVAILABLE and PIL_AVAILABLE:
-        try:
-            images = convert_from_bytes(file_bytes, dpi=150)
-            for i, image in enumerate(images, 1):
-                pages.append({
-                    "page_num": i,
-                    "base64": _image_to_base64(image),
-                    "width": image.width,
-                    "height": image.height,
-                })
-            if pages:
-                return pages
-        except Exception:
-            pass
-
-    if PYMUPDF_AVAILABLE and PIL_AVAILABLE:
-        try:
-            doc = fitz.open(stream=file_bytes, filetype="pdf")
-            for i, page in enumerate(doc, 1):
-                pix = page.get_pixmap(dpi=150)
-                image = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-                pages.append({
-                    "page_num": i,
-                    "base64": _image_to_base64(image),
-                    "width": image.width,
-                    "height": image.height,
-                })
-            doc.close()
-        except Exception:
-            return pages
-
-    return pages
-
-
-def _call_vision_ai(page_base64: str, prompt: str) -> str:
-    """Send image + prompt to OpenRouter vision model."""
-    client = _get_client()
-    response = client.chat.completions.create(
-        model=_get_vision_model(),
-        messages=[{
-            "role": "user",
-            "content": [
-                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{page_base64}"}},
-                {"type": "text", "text": prompt},
-            ],
-        }],
-        max_tokens=1024,
-    )
-    return response.choices[0].message.content or ""
-
-
-def classify_page(page_base64: str, page_num: int, mock: bool = False) -> dict:
-    """
-    Classify an engineering drawing page using vision AI.
-
-    Returns page type, confidence, and feature flags.
-    """
-    default = {
-        "page_num": page_num,
-        "type": "general_notes",
-        "confidence": 0.0,
-        "contains_chainages": False,
-        "structure_types_visible": [],
-        "notes": "",
-    }
-
-    if mock:
-        return {
-            **default,
-            "type": "title_sheet",
-            "confidence": 0.85,
-            "notes": "Mock classification for testing",
-        }
-
-    prompt = (
-        "Classify this engineering drawing page. Return JSON only:\n"
-        "{\n"
-        "  'type': 'plan_view|profile_view|typical_cross_section|"
-        "structure_drawing|general_notes|title_sheet|legend',\n"
-        "  'confidence': 0.0-1.0,\n"
-        "  'contains_chainages': true/false,\n"
-        "  'structure_types_visible': [],\n"
-        "  'notes': 'brief description'\n"
-        "}"
-    )
-
-    try:
-        raw = _call_vision_ai(page_base64, prompt)
-        parsed = _parse_json_response(raw)
-        if not parsed:
-            return default
-        return {
-            "page_num": page_num,
-            "type": parsed.get("type", "general_notes"),
-            "confidence": float(parsed.get("confidence", 0.5)),
-            "contains_chainages": bool(parsed.get("contains_chainages", False)),
-            "structure_types_visible": parsed.get("structure_types_visible", []),
-            "notes": parsed.get("notes", ""),
-        }
-    except Exception as exc:
-        return {**default, "notes": f"classification failed: {exc}"}
-
-
-def extract_from_page(page_base64: str, page_type: str, mock: bool = False) -> dict:
-    """
-    Extract structured data from a drawing page based on its classified type.
-
-    Uses type-specific prompts for plan views, cross sections, and structures.
-    """
-    if mock:
-        if page_type == "typical_cross_section":
-            return {
-                "formation_width_m": 21.5,
-                "carriageway_width_m": 7.0,
-                "layers": [
-                    {"name": "GSB", "thickness_mm": 250},
-                    {"name": "CTB", "thickness_mm": 200},
-                ],
-                "confidence": 0.9,
-            }
-        if page_type == "plan_view":
-            return {
-                "chainages": ["00+000", "44+000"],
-                "structures": [{"chainage": "00+515", "type": "box_culvert", "annotation": "1x3x2", "confidence": 0.9}],
-            }
-        return {"confidence": 0.8}
-
-    prompts = {
-        "plan_view": (
-            "Extract from this road plan view drawing. Return JSON only:\n"
-            "{\n"
-            "  'chainages': ['00+000', '01+000'],\n"
-            "  'structures': [\n"
-            "    {'chainage': '00+515', 'type': 'box_culvert',\n"
-            "     'annotation': '1x3x2', 'confidence': 0.9}\n"
-            "  ]\n"
-            "}"
-        ),
-        "typical_cross_section": (
-            "Extract pavement layers from this cross section. Return JSON only:\n"
-            "{\n"
-            "  'formation_width_m': 21.5,\n"
-            "  'carriageway_width_m': 7.0,\n"
-            "  'layers': [\n"
-            "    {'name': 'GSB', 'thickness_mm': 250},\n"
-            "    {'name': 'CTB', 'thickness_mm': 200}\n"
-            "  ],\n"
-            "  'confidence': 0.9\n"
-            "}"
-        ),
-        "structure_drawing": (
-            "Extract structure details. Return JSON only:\n"
-            "{\n"
-            "  'structure_type': 'box_culvert',\n"
-            "  'cells': 1, 'span_m': 3.0, 'height_m': 2.0,\n"
-            "  'concrete_grade': 'M35', 'steel_grade': 'Fe550D',\n"
-            "  'confidence': 0.9\n"
-            "}"
-        ),
-    }
-
-    prompt = prompts.get(page_type)
-    if not prompt:
-        return {"page_type": page_type, "confidence": 0.0, "notes": "no extractor for page type"}
-
-    try:
-        raw = _call_vision_ai(page_base64, prompt)
-        parsed = _parse_json_response(raw)
-        parsed["page_type"] = page_type
-        return parsed
-    except Exception as exc:
-        return {"page_type": page_type, "confidence": 0.0, "error": str(exc)}
-
-
-def merge_extractions(page_extractions: list[dict]) -> dict[str, Any]:
-    """
-    Merge per-page extractions into a single DrawingExtraction dict.
-
-    Deduplicates structures by chainage and flags low-confidence items.
-    """
-    road_segments: list[dict] = []
-    structures: list[dict] = []
-    flagged: list[dict] = []
-    confidences: list[float] = []
-    drawing_type = "general_notes"
-
-    seen_chainages: set[str] = set()
-
-    try:
-        for ext in page_extractions:
-            page_type = ext.get("page_type", ext.get("type", ""))
-            conf = float(ext.get("confidence", 0.5))
-            confidences.append(conf)
-
-            if page_type in ("plan_view", "profile_view"):
-                drawing_type = page_type
-            elif page_type == "typical_cross_section":
-                drawing_type = "typical_cross_section"
-                layers = ext.get("layers", [])
-                chainages = ext.get("chainages", ["00+000", "44+000"])
-                road_segments.append({
-                    "chainage_start": chainages[0] if chainages else "00+000",
-                    "chainage_end": chainages[-1] if len(chainages) > 1 else chainages[0] if chainages else "44+000",
-                    "length_km": _chainage_length_km(chainages),
-                    "tcs_type": ext.get("tcs_type", "TCS-1"),
-                    "formation_width_m": float(ext.get("formation_width_m", 0)),
-                    "carriageway_width_m": float(ext.get("carriageway_width_m", 0)),
-                    "pavement_layers": layers,
-                })
-
-            for struct in ext.get("structures", []):
-                chainage = str(struct.get("chainage", ""))
-                if chainage and chainage in seen_chainages:
-                    continue
-                if chainage:
-                    seen_chainages.add(chainage)
-                entry = {
-                    "id": struct.get("id", f"STR-{len(structures)+1:03d}"),
-                    "type": struct.get("type", "box_culvert"),
-                    "chainage": chainage,
-                    "cells": int(struct.get("cells", 1)),
-                    "span_m": float(struct.get("span_m", 0)),
-                    "height_m": float(struct.get("height_m", 0)),
-                    "length_m": float(struct.get("length_m", 25.5)),
-                    "embankment": bool(struct.get("embankment", False)),
-                    "concrete_grade": struct.get("concrete_grade", "M35"),
-                    "steel_grade": struct.get("steel_grade", "Fe550D"),
-                }
-                structures.append(entry)
-                if float(struct.get("confidence", conf)) < 0.75:
-                    flagged.append({"chainage": chainage, "reason": "low confidence structure"})
-
-            if page_type == "structure_drawing":
-                drawing_type = "structure_drawing"
-                entry = {
-                    "id": f"STR-{len(structures)+1:03d}",
-                    "type": ext.get("structure_type", "box_culvert"),
-                    "chainage": ext.get("chainage", ""),
-                    "cells": int(ext.get("cells", 1)),
-                    "span_m": float(ext.get("span_m", 0)),
-                    "height_m": float(ext.get("height_m", 0)),
-                    "length_m": float(ext.get("length_m", 25.5)),
-                    "embankment": False,
-                    "concrete_grade": ext.get("concrete_grade", "M35"),
-                    "steel_grade": ext.get("steel_grade", "Fe550D"),
-                }
-                structures.append(entry)
-                if conf < 0.75:
-                    flagged.append({"structure_id": entry["id"], "reason": "low confidence structure drawing"})
-
-            if conf < 0.75:
-                flagged.append({"page_type": page_type, "reason": "low confidence page"})
-
-    except (TypeError, ValueError, KeyError) as exc:
-        return {
-            "drawing_type": drawing_type,
-            "confidence": 0.0,
-            "road_segments": road_segments,
-            "structures": structures,
-            "flagged_for_review": flagged,
-            "extraction_confidence": 0.0,
-            "error": str(exc),
-        }
-
-    avg_conf = round(sum(confidences) / len(confidences), 2) if confidences else 0.0
-
-    return {
-        "drawing_type": drawing_type,
-        "confidence": avg_conf,
-        "road_segments": road_segments,
-        "structures": structures,
-        "flagged_for_review": flagged,
-        "extraction_confidence": avg_conf,
-    }
-
-
-def analyze_drawing(
-    file_bytes: bytes,
-    filename: str,
-    estimation_type: str,
-    use_mock_ai: bool = False,
-) -> dict[str, Any]:
-    """
-    Main entry point: rasterize PDF, classify pages, extract data, and merge.
-
-    Called by the drawing router. Set use_mock_ai=True for offline testing.
-    """
-    try:
-        pages = rasterize_pdf_pages(file_bytes)
-        if not pages:
-            return {
-                "filename": filename,
-                "estimation_type": estimation_type,
-                "drawing_type": "general_notes",
-                "confidence": 0.0,
-                "road_segments": [],
-                "structures": [],
-                "flagged_for_review": [{"reason": "could not rasterize PDF"}],
-                "extraction_confidence": 0.0,
-                "error": "rasterization failed or pdf2image unavailable",
-            }
-
-        page_extractions: list[dict] = []
-        for page in pages[:10]:
-            classification = classify_page(page["base64"], page["page_num"], mock=use_mock_ai)
-            page_type = classification.get("type", "general_notes")
-            extraction = extract_from_page(page["base64"], page_type, mock=use_mock_ai)
-            extraction["page_type"] = page_type
-            extraction["confidence"] = float(extraction.get("confidence", classification.get("confidence", 0.5)))
-            page_extractions.append(extraction)
-
-        merged = merge_extractions(page_extractions)
-        merged["filename"] = filename
-        merged["estimation_type"] = estimation_type
-        merged["pages_analyzed"] = len(pages)
-        return merged
-
-    except Exception as exc:
-        return {
-            "filename": filename,
-            "estimation_type": estimation_type,
-            "drawing_type": "general_notes",
-            "confidence": 0.0,
-            "road_segments": [],
-            "structures": [],
-            "flagged_for_review": [{"reason": str(exc)}],
-            "extraction_confidence": 0.0,
-            "error": str(exc),
-        }
-
-
-def _chainage_length_km(chainages: list[str]) -> float:
-    """Estimate road length in km from first and last chainage strings."""
-    try:
-        if len(chainages) < 2:
-            return 0.0
-        start = _chainage_to_metres(chainages[0])
-        end = _chainage_to_metres(chainages[-1])
-        return round(abs(end - start) / 1000, 2)
-    except (TypeError, ValueError):
-        return 0.0
-
-
-def _chainage_to_metres(chainage: str) -> float:
-    chainage = chainage.replace(" ", "")
-    if "+" in chainage:
-        parts = chainage.split("+")
-        return float(parts[0]) * 1000 + float(parts[1])
-    return float(chainage)
 
 
 def extract_text_layer(file_bytes: bytes) -> dict:
@@ -445,3 +27,382 @@ def extract_text_layer(file_bytes: bytes) -> dict:
         "pages_with_text": sum(1 for p in pages if p["has_meaningful_text"]),
         "pages": pages
     }
+
+
+def classify_page_by_text(text: str) -> str:
+    """
+    Classify a drawing page from its extracted text.
+
+    Returns one of: tcs, plan_profile, title, unknown
+    """
+    upper = text.upper()
+    if len(text.strip()) < 20:
+        return "title"
+    if (
+        "TYPICAL CROSS SECTION" in upper
+        or "TCS -" in upper
+        or "TCS-" in upper
+        or "FORMATION WIDTH" in upper
+    ):
+        return "tcs"
+    if (
+        "CULVERT" in upper
+        or "CHAINAGE" in upper
+        or "SET OUT DATA" in upper
+        or "PROP. CENTER LINE" in upper
+    ):
+        return "plan_profile"
+    return "unknown"
+
+
+_LAYER_NAME_MAP = {
+    "BC": "BC",
+    "DBM": "DBM",
+    "GSB": "GSB",
+    "CTB": "CTB",
+    "PQC": "PQC",
+    "FDR": "FDR",
+    "DLC": "DLC",
+    "BM": "BM",
+    "PRIME COAT": "PRIME COAT",
+    "TACK COAT": "TACK COAT",
+}
+
+
+def _normalize_layer_name(raw: str) -> str:
+    name = raw.upper().strip()
+    for key in _LAYER_NAME_MAP:
+        if name.startswith(key):
+            return _LAYER_NAME_MAP[key]
+    return name.split("-")[0].split("(")[0].strip()
+
+
+def _extract_layers(text: str) -> list[dict]:
+    """Extract pavement layers from TCS page text."""
+    layers: list[dict] = []
+    seen: set[str] = set()
+
+    pat_thickness_first = re.compile(
+        r"(\d{2,3})\s*MM?\s*(?:RECLAMED\s+)?(BC|DBM|GSB|CTB|PQC|FDR|DLC|BM|PRIME COAT|TACK COAT)",
+        re.IGNORECASE,
+    )
+    for match in pat_thickness_first.finditer(text):
+        thickness = int(match.group(1))
+        name = _normalize_layer_name(match.group(2))
+        if name not in seen:
+            seen.add(name)
+            layers.append({"name": name, "thickness_mm": thickness})
+
+    pat_name_first = re.compile(
+        r"(BC|DBM|GSB|CTB|PQC|FDR|DLC|BM)[- ]*\(?GRADING[- ]*[IVX]+\)?\s*(\d{2,3})\s*MM?",
+        re.IGNORECASE,
+    )
+    for match in pat_name_first.finditer(text):
+        name = _normalize_layer_name(match.group(1))
+        thickness = int(match.group(2))
+        if name not in seen:
+            seen.add(name)
+            layers.append({"name": name, "thickness_mm": thickness})
+
+    return layers
+
+
+def parse_tcs_page(text: str, page_num: int) -> Optional[dict]:
+    """
+    Extract pavement layer data from a Typical Cross Section page.
+
+    Returns None if no pavement layers are found.
+    """
+    try:
+        layers = _extract_layers(text)
+        if not layers:
+            return None
+
+        tcs_type = None
+        tcs_match = re.search(r"TCS\s*[-–]?\s*(\d+)", text, re.IGNORECASE)
+        if tcs_match:
+            tcs_type = f"TCS-{tcs_match.group(1)}"
+
+        formation_width_mm = None
+        for pat in (
+            r"(\d{4,6})\s*\n?\s*FORMATION WIDTH",
+            r"FORMATION WIDTH\s*\n?\s*(\d{4,6})",
+        ):
+            m = re.search(pat, text, re.IGNORECASE)
+            if m:
+                formation_width_mm = int(m.group(1))
+                break
+
+        carriageway_width_mm = None
+        cw_matches = re.findall(
+            r"(\d{4,5})\s*\n?\s*(?:PAVED\s+)?CARRIAGE\s*WAY",
+            text,
+            re.IGNORECASE,
+        )
+        if cw_matches:
+            carriageway_width_mm = int(cw_matches[0])
+
+        confidence = 0.5
+        if tcs_type:
+            confidence += 0.2
+        if formation_width_mm:
+            confidence += 0.1
+        if len(layers) >= 2:
+            confidence += 0.1
+        if carriageway_width_mm:
+            confidence += 0.1
+
+        return {
+            "page_num": page_num,
+            "tcs_type": tcs_type or f"TCS-page-{page_num}",
+            "formation_width_mm": formation_width_mm,
+            "carriageway_width_mm": carriageway_width_mm,
+            "layers": layers,
+            "confidence": round(min(confidence, 1.0), 2),
+        }
+    except (TypeError, ValueError):
+        return None
+
+
+def _normalize_structure_type(size_str: str) -> str:
+    upper = size_str.upper()
+    if any(k in upper for k in ("PIPE CULVERT", "HPC", " NP", "NP ")):
+        return "pipe_culvert"
+    if "BOX" in upper or "RCC BOX" in upper:
+        return "box_culvert"
+    if "SLAB" in upper:
+        return "slab_culvert"
+    if "BRIDGE" in upper:
+        return "bridge"
+    if "VUP" in upper:
+        return "vup"
+    if "LUP" in upper:
+        return "lup"
+    if "ROB" in upper or "ROU" in upper:
+        return "rob"
+    return "unknown"
+
+
+def _parse_dimensions(size_str: str, struct_type: str) -> dict:
+    dims: dict[str, Any] = {}
+    box_match = re.search(r"(\d+)[Xx](\d+\.?\d*)[Xx](\d+\.?\d*)", size_str)
+    if box_match:
+        dims["cells"] = int(box_match.group(1))
+        dims["span_m"] = float(box_match.group(2))
+        dims["height_m"] = float(box_match.group(3))
+        return dims
+
+    two_match = re.search(r"(\d+)[Xx](\d+\.?\d*)\s*m?", size_str, re.IGNORECASE)
+    if two_match:
+        dims["cells"] = int(two_match.group(1))
+        val = float(two_match.group(2))
+        if struct_type == "pipe_culvert":
+            dims["dia_m"] = val
+        else:
+            dims["span_m"] = val
+    return dims
+
+
+def _clean_dash_value(value: str) -> Optional[str]:
+    cleaned = value.strip()
+    if not cleaned or re.fullmatch(r"[-–\s]+", cleaned):
+        return None
+    return cleaned
+
+
+def parse_pp_page(text: str, page_num: int) -> list[dict]:
+    """
+    Extract culvert/bridge records from a Plan & Profile page.
+
+    Returns a list of structure dicts (may be empty).
+    """
+    results: list[dict] = []
+
+    try:
+        block_pattern = re.compile(
+            r"CULVERT/BRIDGE DETAIL\s*\(\s*(RETAIN|NEW|RECONSTRUCT|WIDEN)\s*\)"
+            r"(.*?)(?=CULVERT/BRIDGE DETAIL|$)",
+            re.IGNORECASE | re.DOTALL,
+        )
+
+        for block_match in block_pattern.finditer(text):
+            action = block_match.group(1).upper()
+            block = block_match.group(2)
+
+            chainage_match = re.search(
+                r"EXISTING CHAINAGE:\s*(\d+\+\d+(?:\.\d+)?)",
+                block,
+                re.IGNORECASE,
+            )
+            if not chainage_match:
+                continue
+            chainage = chainage_match.group(1)
+
+            size_match = re.search(
+                r"EXIST\.\s*SIZE\s*&\s*TYPE:\s*([^\n]+)",
+                block,
+                re.IGNORECASE,
+            )
+            existing_size = size_match.group(1).strip() if size_match else "UNKNOWN"
+
+            proposed_chainage = None
+            prop_ch_match = re.search(
+                r"PROPOSED CHAINAGE:\s*([^\n]+)",
+                block,
+                re.IGNORECASE,
+            )
+            if prop_ch_match:
+                proposed_chainage = _clean_dash_value(prop_ch_match.group(1))
+
+            proposed_size = None
+            prop_size_match = re.search(
+                r"PROP\.\s*SIZE\s*&\s*TYPE:\s*([^\n]+)",
+                block,
+                re.IGNORECASE,
+            )
+            if prop_size_match:
+                proposed_size = _clean_dash_value(prop_size_match.group(1))
+
+            struct_type = _normalize_structure_type(existing_size)
+            dims = _parse_dimensions(existing_size, struct_type)
+
+            confidence = 0.85 if "CULVERT" in existing_size.upper() else 0.7
+
+            entry: dict[str, Any] = {
+                "chainage": chainage,
+                "type": struct_type,
+                "existing_size": existing_size,
+                "proposed_size": proposed_size,
+                "proposed_chainage": proposed_chainage,
+                "action": action,
+                "confidence": confidence,
+                "page_num": page_num,
+            }
+            entry.update(dims)
+            results.append(entry)
+
+    except (TypeError, ValueError):
+        return results
+
+    return results
+
+
+def merge_extractions(tcs_results: list[dict], pp_results: list[dict]) -> dict[str, Any]:
+    """
+    Combine TCS and P&P parse results into a final DrawingExtraction dict.
+
+    Deduplicates structures by chainage, keeping the higher-confidence record.
+    """
+    road_segments: list[dict] = []
+    for tcs in tcs_results:
+        fw = tcs.get("formation_width_mm")
+        cw = tcs.get("carriageway_width_mm")
+        road_segments.append({
+            "tcs_type": tcs.get("tcs_type"),
+            "formation_width_m": round(fw / 1000, 2) if fw else None,
+            "carriageway_width_m": round(cw / 1000, 2) if cw else None,
+            "pavement_layers": tcs.get("layers", []),
+            "layers": tcs.get("layers", []),
+            "confidence": tcs.get("confidence", 0.0),
+            "page_num": tcs.get("page_num"),
+        })
+
+    structures_by_chainage: dict[str, dict] = {}
+
+    for item in pp_results:
+        chainage = item.get("chainage", "")
+        if not chainage:
+            continue
+        existing = structures_by_chainage.get(chainage)
+        if existing and existing.get("confidence", 0) >= item.get("confidence", 0):
+            continue
+        structures_by_chainage[chainage] = item
+
+    prefix_map = {
+        "pipe_culvert": "PC",
+        "box_culvert": "BC",
+        "slab_culvert": "SC",
+        "bridge": "BR",
+    }
+    id_counters: dict[str, int] = {}
+    structures: list[dict] = []
+    for item in structures_by_chainage.values():
+        stype = item.get("type", "unknown")
+        prefix = prefix_map.get(stype, "ST")
+        id_counters[prefix] = id_counters.get(prefix, 0) + 1
+        struct_id = f"{prefix}-{id_counters[prefix]:03d}"
+
+        entry: dict[str, Any] = {
+            "id": struct_id,
+            "type": stype,
+            "chainage": item.get("chainage"),
+            "action": item.get("action"),
+            "confidence": item.get("confidence", 0.0),
+            "existing_size": item.get("existing_size"),
+            "proposed_size": item.get("proposed_size"),
+            "page_num": item.get("page_num"),
+        }
+        for key in ("cells", "span_m", "height_m", "dia_m", "length_m"):
+            if key in item:
+                entry[key] = item[key]
+        structures.append(entry)
+
+    all_confidences = [t.get("confidence", 0) for t in tcs_results] + [s.get("confidence", 0) for s in pp_results]
+    avg_conf = round(sum(all_confidences) / len(all_confidences), 2) if all_confidences else 0.0
+
+    return {
+        "drawing_type": "typical_cross_section" if tcs_results else "plan_view",
+        "road_segments": road_segments,
+        "structures": structures,
+        "total_tcs_pages": len(tcs_results),
+        "total_pp_pages": len({p.get("page_num") for p in pp_results}),
+        "extraction_confidence": avg_conf,
+        "confidence": avg_conf,
+        "flagged_for_review": [],
+    }
+
+
+def analyze_drawing(file_bytes: bytes, filename: str, estimation_type: str) -> dict[str, Any]:
+    """
+    Main entry point: extract text, classify pages, parse TCS/P&P data, merge.
+
+    Called by the drawing router. Uses regex on PDF text layer only.
+    """
+    try:
+        text_layer = extract_text_layer(file_bytes)
+        tcs_results: list[dict] = []
+        pp_results: list[dict] = []
+
+        for page in text_layer.get("pages", []):
+            text = page.get("text", "")
+            page_num = page.get("page_num", 0)
+            page_type = classify_page_by_text(text)
+
+            if page_type == "tcs":
+                parsed = parse_tcs_page(text, page_num)
+                if parsed:
+                    tcs_results.append(parsed)
+            elif page_type == "plan_profile":
+                pp_results.extend(parse_pp_page(text, page_num))
+
+        merged = merge_extractions(tcs_results, pp_results)
+        merged["filename"] = filename
+        merged["estimation_type"] = estimation_type
+        merged["total_pages"] = text_layer.get("total_pages", 0)
+        merged["pages_with_text"] = text_layer.get("pages_with_text", 0)
+        return merged
+
+    except Exception as exc:
+        return {
+            "filename": filename,
+            "estimation_type": estimation_type,
+            "drawing_type": "unknown",
+            "road_segments": [],
+            "structures": [],
+            "total_tcs_pages": 0,
+            "total_pp_pages": 0,
+            "extraction_confidence": 0.0,
+            "confidence": 0.0,
+            "flagged_for_review": [{"reason": str(exc)}],
+            "error": str(exc),
+        }
