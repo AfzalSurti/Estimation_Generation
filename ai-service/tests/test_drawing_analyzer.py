@@ -16,12 +16,25 @@ def test_tcs_extraction():
 
     segments = result.get("road_segments", [])
     print(f"Road segments found: {len(segments)}")
+    project_total_m = 0
     for seg in segments:
+        ranges = seg.get("chainage_ranges", [])
+        total_m = seg.get("total_length_m", 0)
+        project_total_m += total_m
         print(f"\n  {seg.get('tcs_type')}")
         print(f"    formation_width_m : {seg.get('formation_width_m')}")
         print(f"    carriageway_width_m: {seg.get('carriageway_width_m')}")
         print(f"    layers            : {seg.get('layers')}")
+        print(f"    chainage_ranges   : {len(ranges)} ranges")
+        print(f"    total_length_m    : {total_m}")
+        for i, r in enumerate(ranges[:2]):
+            print(
+                f"    ranges[{i}]       : {r.get('chainage_from')} to "
+                f"{r.get('chainage_to')} = {r.get('length_m')}m"
+            )
         print(f"    confidence        : {seg.get('confidence')}")
+
+    print(f"\n  PROJECT TOTAL LENGTH: {project_total_m}m")
 
     assert len(segments) >= 3, f"Expected >= 3 road segments, got {len(segments)}"
     print("\nPASS: test_tcs_extraction")
